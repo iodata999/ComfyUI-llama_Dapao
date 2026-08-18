@@ -3,6 +3,8 @@ import io
 import gc
 import json
 import base64
+import re
+import sys
 
 import numpy as np
 import torch
@@ -28,6 +30,7 @@ class AnyType(str):
 any_type = AnyType("*")
 
 # ── 按需 import 各 ChatHandler（兼容不同版本 llama-cpp-python）──────────────
+import llama_cpp
 from llama_cpp import Llama
 from llama_cpp.llama_chat_format import (
     Llava15ChatHandler, Llava16ChatHandler, MoondreamChatHandler,
@@ -69,6 +72,15 @@ except Exception:
     Qwen35ChatHandler = None
 
 try:
+    from llama_cpp.llama_chat_format import (
+        Jinja2ChatFormatter,
+        chat_formatter_to_chat_completion_handler,
+    )
+except Exception:
+    Jinja2ChatFormatter = None
+    chat_formatter_to_chat_completion_handler = None
+
+try:
     from llama_cpp.llama_chat_format import GLM46VChatHandler, GLM41VChatHandler
 except Exception:
     GLM46VChatHandler = None
@@ -91,6 +103,7 @@ CHAT_HANDLERS = [
     "MiniCPM-v2.6", "MiniCPM-v4.5", "MiniCPM-v4.5-Thinking",
     "Gemma3", "Gemma4",
     "Qwen2.5-VL",
+    "Qwen3.8",
     "Qwen3-VL", "Qwen3-VL-Thinking",
     "Qwen3.5", "Qwen3.5-Thinking",
     "GLM-4.6V", "GLM-4.6V-Thinking", "GLM-4.1V-Thinking",
@@ -100,6 +113,7 @@ CHAT_HANDLERS = [
 
 _QWEN_HANDLER_ARCHITECTURES = {
     "Qwen2.5-VL": "qwen2vl",
+    "Qwen3.8": "qwen35",
     "Qwen3-VL": "qwen3vl",
     "Qwen3-VL-Thinking": "qwen3vl",
     "Qwen3.5": "qwen35",
@@ -111,6 +125,90 @@ _QWEN_ARCHITECTURE_HANDLERS = {
     "qwen3vl": "Qwen3-VL",
     "qwen35": "Qwen3.5",
 }
+
+_QWEN38_MIN_LLAMA_CPP_VERSION = (0, 3, 47)
+QWEN38_REASONING_OPTIONS = ["关闭", "自动", "低", "中等", "高"]
+_QWEN38_REASONING_VALUES = {
+    "关闭": "off",
+    "自动": "xhigh",
+    "低": "low",
+    "中等": "medium",
+    "高": "xhigh",
+    # Older workflows and the reference node use the native English values.
+    "off": "off",
+    "xhigh": "xhigh",
+    "medium": "medium",
+    "low": "low",
+}
+
+_VRAM_TOOLTIP = (
+    "这是LLM可使用的显存预算，不是预留空间。-1=尝试全部放入GPU，最快但可能因显存不足失败；"
+    "填写数值=只将部分模型层放入GPU，其余使用系统内存。参考起点：8GB显卡填6，12GB填10，"
+    "16GB填13，24GB填20，32GB填24-28。请为ComfyUI、mmproj和上下文缓存保留约2GB。"
+)
+
+
+def _llama_cpp_version():
+    return str(getattr(llama_cpp, "__version__", "未知"))
+
+
+def _version_tuple(version):
+    numbers = re.findall(r"\d+", str(version))
+    if len(numbers) < 3:
+        return None
+    return tuple(int(number) for number in numbers[:3])
+
+
+def normalize_qwen38_reasoning_effort(value):
+    if value is None:
+        return "off"
+    try:
+        return _QWEN38_REASONING_VALUES[str(value)]
+    except KeyError as error:
+        raise ValueError(f"未知 Qwen3.8 推理强度：{value}") from error
+
+
+def _validate_qwen38_backend():
+    version = _llama_cpp_version()
+    parsed = _version_tuple(version)
+    if parsed is not None and parsed < _QWEN38_MIN_LLAMA_CPP_VERSION:
+        raise RuntimeError(
+            "Qwen3.8 需要支持 MTP/NextN 张量的新版 llama-cpp-python。"
+            f"当前版本为 {version}，最低需要 0.3.47；旧版会在加载时缺少 "
+            "blk.64.ssm_conv1d.weight。请按本节点 README 安装与你的 Python、"
+            "操作系统和 CUDA 匹配的 JamePeng 0.3.47+ wheel，然后重启 ComfyUI。"
+            f"当前 Python：{sys.executable}"
+        )
+
+
+def _normalize_handler_name(handler_name):
+    """Migrate the temporary Qwen3-8B label used by older workflows."""
+    return "Qwen3.8" if handler_name == "Qwen3-8B" else handler_name
+
+
+def _should_analyze_images_individually(user_prompt):
+    """Keep comparison tasks in one request; otherwise analyze static images separately."""
+    comparison_keywords = (
+        "比较", "对比", "区别", "差异", "相同", "不同", "关联", "关系",
+        "排序", "挑选", "哪张", "所有图片", "整体", "共同",
+    )
+    return not any(keyword in user_prompt for keyword in comparison_keywords)
+
+
+def _select_inference_strategy(frame_count, has_video_input, has_audio_input, user_prompt):
+    if has_video_input:
+        return "视频帧联合分析"
+    if has_audio_input and frame_count:
+        return "图文音联合分析"
+    if frame_count > 1 and _should_analyze_images_individually(user_prompt):
+        return "多图逐张分析"
+    if frame_count > 1:
+        return "多图联合分析"
+    if frame_count:
+        return "单图分析"
+    if has_audio_input:
+        return "音频分析"
+    return "纯文本分析"
 
 
 def _validate_multimodal_pair(model_path, model_file, handler_name, mmproj_path, mmproj_file):
@@ -230,6 +328,114 @@ def audio2base64(audio_dict):
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def _create_multimodal_handler(handler_class, mmproj_path, **kwargs):
+    """Support both llama-cpp handler constructor spellings."""
+    try:
+        return handler_class(mmproj_path=mmproj_path, **kwargs)
+    except TypeError as error:
+        message = str(error)
+        if "mmproj_path" not in message and "clip_model_path" not in message:
+            raise
+        return handler_class(clip_model_path=mmproj_path, **kwargs)
+
+
+def _adapt_qwen38_chat_template(chat_template):
+    """Adapt Qwen3.8's image_pad token to llama.cpp's MTMD image URL input."""
+    if not chat_template or "<|image_pad|>" not in chat_template:
+        return chat_template
+
+    pattern = (
+        r"\{\{-?\s*(['\"])<\|vision_start\|><\|image_pad\|><\|vision_end\|>\1\s*-?\}\}"
+    )
+    replacement = (
+        "{{- '<|vision_start|>' }}"
+        "{%- if item.image_url is string %}"
+        "{{- item.image_url }}"
+        "{%- else %}"
+        "{{- item.image_url.url }}"
+        "{%- endif %}"
+        "{{- '<|vision_end|>' }}"
+    )
+    adapted, count = re.subn(pattern, replacement, chat_template)
+    if count == 0:
+        raise RuntimeError(
+            "Qwen3.8 聊天模板包含 <|image_pad|>，但无法适配当前 llama.cpp 多模态处理器。"
+        )
+    return adapted
+
+
+def _create_qwen38_mm_handler(
+    mmproj_path, *, enable_thinking, preserve_thinking, reasoning_effort,
+    chat_template_override, image_min_tokens, image_max_tokens,
+):
+    if Qwen35ChatHandler is None:
+        raise RuntimeError("Qwen3.8 需要 Qwen35ChatHandler，请升级 llama-cpp-python。")
+
+    shared = {
+        "verbose": False,
+        "extra_template_arguments": {"reasoning_effort": reasoning_effort},
+        "chat_template_override": chat_template_override,
+    }
+    if _MTMD:
+        shared.update(
+            image_min_tokens=image_min_tokens,
+            image_max_tokens=image_max_tokens,
+        )
+    candidates = [
+        {"enable_thinking": enable_thinking, "preserve_thinking": preserve_thinking,
+         "add_vision_id": True, **shared},
+        {"enable_thinking": enable_thinking, "preserve_thinking": preserve_thinking, **shared},
+        {"enable_thinking": enable_thinking, "add_vision_id": True, **shared},
+        {"enable_thinking": enable_thinking, **shared},
+    ]
+    last_error = None
+    for kwargs in candidates:
+        try:
+            return _create_multimodal_handler(Qwen35ChatHandler, mmproj_path, **kwargs)
+        except TypeError as error:
+            last_error = error
+    raise last_error or RuntimeError("创建 Qwen3.8 多模态处理器失败。")
+
+
+def _create_qwen38_text_handler(llm, *, enable_thinking, preserve_thinking, reasoning_effort):
+    if Jinja2ChatFormatter is None or chat_formatter_to_chat_completion_handler is None:
+        raise RuntimeError("当前 llama-cpp-python 不支持 Qwen3.8 聊天模板，请升级 llama-cpp-python。")
+
+    metadata = getattr(llm, "metadata", {}) or {}
+    chat_template = metadata.get("tokenizer.chat_template")
+    if not chat_template:
+        raise RuntimeError("Qwen3.8 GGUF 缺少 tokenizer.chat_template。")
+
+    model = getattr(llm, "_model", None)
+
+    def token_text(token_id):
+        if token_id == -1 or model is None or not hasattr(model, "token_get_text"):
+            return ""
+        return model.token_get_text(token_id)
+
+    stop_token_ids = [
+        token_id
+        for token_id in (llm.token_eos(), llm.token_eot())
+        if token_id != -1
+    ] or None
+    formatter = Jinja2ChatFormatter(
+        template=chat_template,
+        eos_token=token_text(llm.token_eos()),
+        bos_token=token_text(llm.token_bos()),
+        stop_token_ids=stop_token_ids,
+    )
+
+    def qwen38_formatter(*, messages, **kwargs):
+        kwargs.update(
+            enable_thinking=enable_thinking,
+            preserve_thinking=preserve_thinking,
+            reasoning_effort=reasoning_effort,
+        )
+        return formatter(messages=messages, **kwargs)
+
+    return chat_formatter_to_chat_completion_handler(qwen38_formatter)
+
+
 # ── 主节点 ───────────────────────────────────────────────────────────────────
 class Dapao_LlamaChat:
     CATEGORY = "🍭大炮-llama-cpp"
@@ -250,14 +456,22 @@ class Dapao_LlamaChat:
                 "🔌对话处理器": (CHAT_HANDLERS, {"default": "None"}),
                 "🖼️mmproj文件": (mmproj_files, {"default": "None"}),
                 "📐上下文长度": ("INT", {"default": 8192, "min": 512, "max": 131072, "step": 512}),
-                "💾显存限制(GB)": ("FLOAT", {"default": -1, "min": -1, "max": 999.0, "step": 0.5, "tooltip": "-1 表示不限制（全部放 GPU）"}),
+                "💾显存限制(GB)": (
+                    "FLOAT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "max": 999.0,
+                        "step": 0.5,
+                        "tooltip": _VRAM_TOOLTIP,
+                    },
+                ),
                 "🔢图像最小token": ("INT", {"default": 256, "min": 1, "max": 4096, "step": 1}),
                 "🔢图像最大token": ("INT", {"default": 1344, "min": 1, "max": 8192, "step": 1}),
                 # ── 提示词 ──
                 "📝系统提示词": ("STRING", {"default": "You are a helpful assistant.", "multiline": True}),
                 "💬用户提示词": ("STRING", {"default": "请描述这张图片。", "multiline": True}),
                 # ── 推理参数 ──
-                "🎯推理模式": (["one by one", "images", "video"], {"default": "one by one"}),
                 "🎞️最大帧数": ("INT", {"default": 10, "min": 1, "max": 200, "step": 1}),
                 "📏图像最大边长": ("INT", {"default": 1120, "min": 64, "max": 4096, "step": 32}),
                 # ── 生成参数 ──
@@ -268,6 +482,7 @@ class Dapao_LlamaChat:
                 "🔝top_k": ("INT", {"default": 40, "min": 0, "max": 200, "step": 1}),
                 "🔁重复惩罚": ("FLOAT", {"default": 1.1, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "🧠思考模式": ("BOOLEAN", {"default": False, "tooltip": "开启后模型会输出思考过程（仅 Thinking 系列模型有效）"}),
+                "🧠Qwen3.8推理强度": (QWEN38_REASONING_OPTIONS, {"default": "关闭", "tooltip": "仅 Qwen3.8 生效；关闭=不思考，自动/高=模型最高档，低/中等=降低思考强度。"}),
                 "💾保存对话历史": ("BOOLEAN", {"default": False}),
                 "⚡推理后卸载模型": ("BOOLEAN", {"default": False}),
             },
@@ -292,20 +507,26 @@ class Dapao_LlamaChat:
         }
 
     def _load_model(self, model_file, handler_name, mmproj_file, n_ctx, vram_limit_gb,
-                    image_min_tokens, image_max_tokens, think_mode=False):
+                    image_min_tokens, image_max_tokens, think_mode=False,
+                    reasoning_effort="off"):
+        handler_name = _normalize_handler_name(handler_name)
+        reasoning_effort = normalize_qwen38_reasoning_effort(reasoning_effort)
         model_path = os.path.join(folder_paths.models_dir, "LLM", model_file)
         mmproj_path = None
         if mmproj_file and mmproj_file != "None":
             mmproj_path = os.path.join(folder_paths.models_dir, "LLM", mmproj_file)
+
+        if handler_name == "Qwen3.8":
+            _validate_qwen38_backend()
 
         _validate_multimodal_pair(
             model_path, model_file, handler_name, mmproj_path, mmproj_file
         )
 
         # ── n_gpu_layers 计算（与参考节点一致，含 1.55 系数）────────────────
+        layer_count = get_layer_count(model_path) or 32
         n_gpu_layers = -1
         if vram_limit_gb != -1:
-            layer_count = get_layer_count(model_path) or 32
             model_size_gb = os.path.getsize(model_path) * 1.55 / (1024 ** 3)
             layer_size_gb = model_size_gb / layer_count
 
@@ -316,6 +537,22 @@ class Dapao_LlamaChat:
                 n_gpu_layers = max(1, int(vram_limit_gb / layer_size_gb))
 
         print(f"[大炮-llama] 加载模型: {model_file}  n_gpu_layers={n_gpu_layers}")
+        if n_gpu_layers != -1 and n_gpu_layers < layer_count:
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                free_gb = free_bytes / (1024 ** 3)
+                total_gb = total_bytes / (1024 ** 3)
+                suggested_gb = max(1, int(free_gb - 2.0))
+                gpu_hint = (
+                    f"当前CUDA可用显存约 {free_gb:.1f}/{total_gb:.1f} GB；"
+                    f"若没有其他即将执行的GPU节点，可尝试把显存限制提高到约 {suggested_gb} GB。"
+                )
+            except Exception:
+                gpu_hint = "若显卡仍有空闲显存，可逐步提高“显存限制(GB)”。"
+            print(
+                f"[大炮-llama] 性能提示：当前仅 {n_gpu_layers}/{layer_count} 层在GPU，"
+                f"其余层由CPU计算，速度会明显下降。{gpu_hint}"
+            )
 
         # ── 实例化 ChatHandler ────────────────────────────────────────────────
         chat_handler = None
@@ -419,7 +656,7 @@ class Dapao_LlamaChat:
             elif handler_name == "MiniCPM-v2.6":
                 chat_handler = MiniCPMv26ChatHandler(**kwargs)
 
-        elif handler_name not in ("None", "Qwen3.5", "Qwen3.5-Thinking"):
+        elif handler_name not in ("None", "Qwen3.8", "Qwen3.5", "Qwen3.5-Thinking"):
             # 无 mmproj 但有 handler（纯文本模式下某些 handler 可无 mmproj）
             pass
 
@@ -433,6 +670,31 @@ class Dapao_LlamaChat:
                 n_ctx=n_ctx,
                 verbose=False,
             )
+
+            if handler_name == "Qwen3.8":
+                chat_template = (getattr(llm, "metadata", {}) or {}).get(
+                    "tokenizer.chat_template"
+                )
+                if not chat_template:
+                    raise RuntimeError("Qwen3.8 GGUF 缺少 tokenizer.chat_template。")
+                if mmproj_path:
+                    chat_handler = _create_qwen38_mm_handler(
+                        mmproj_path,
+                        enable_thinking=think_mode and reasoning_effort != "off",
+                        preserve_thinking=False,
+                        reasoning_effort=reasoning_effort,
+                        chat_template_override=_adapt_qwen38_chat_template(chat_template),
+                        image_min_tokens=image_min_tokens,
+                        image_max_tokens=image_max_tokens,
+                    )
+                else:
+                    chat_handler = _create_qwen38_text_handler(
+                        llm,
+                        enable_thinking=think_mode and reasoning_effort != "off",
+                        preserve_thinking=False,
+                        reasoning_effort=reasoning_effort,
+                    )
+                llm.chat_handler = chat_handler
 
             # MTMD 默认延迟到首次推理才加载。这里提前验证，避免缓存无效处理器。
             if chat_handler is not None and hasattr(chat_handler, "_init_mtmd_context"):
@@ -451,11 +713,54 @@ class Dapao_LlamaChat:
                             f"主模型“{model_file}”，mmproj“{mmproj_file}”。"
                             "请确认两者来自同一模型系列和参数规模，且 GGUF 文件完整。"
                         ) from cpu_error
-        except Exception:
+        except Exception as load_error:
             if chat_handler is not None and hasattr(chat_handler, "close"):
                 chat_handler.close()
             if llm is not None and hasattr(llm, "close"):
                 llm.close()
+            if isinstance(load_error, ValueError) and "Failed to load model from file" in str(load_error):
+                try:
+                    model_size_gb = os.path.getsize(model_path) / (1024 ** 3)
+                except OSError:
+                    model_size_gb = None
+                try:
+                    mmproj_size_gb = (
+                        os.path.getsize(mmproj_path) / (1024 ** 3)
+                        if mmproj_path else 0.0
+                    )
+                except OSError:
+                    mmproj_size_gb = None
+                size_parts = []
+                if model_size_gb is not None:
+                    size_parts.append(f"主模型文件约 {model_size_gb:.1f} GB")
+                if mmproj_size_gb is not None and mmproj_size_gb > 0:
+                    size_parts.append(f"mmproj约 {mmproj_size_gb:.1f} GB")
+                size_hint = "，".join(size_parts) + "。" if size_parts else ""
+                estimated = (
+                    (model_size_gb or 0.0) * 1.55 + (mmproj_size_gb or 0.0) * 1.55
+                    if model_size_gb is not None and mmproj_size_gb is not None
+                    else None
+                )
+                estimate_hint = (
+                    f"粗略加载预算约 {estimated:.1f} GB（还未计入上下文缓存）。"
+                    if estimated is not None else ""
+                )
+                if n_gpu_layers == -1:
+                    raise RuntimeError(
+                        f"模型加载失败：{size_hint}{estimate_hint}"
+                        "当前“显存限制(GB)”为 -1，表示尝试全部放入GPU；"
+                        "这通常是显存不足，而不是提示词或图片输入错误。"
+                        "请把该参数改成实际剩余显存的一部分（新手可先填8），"
+                        "让模型自动部分卸载到系统内存后重试；显存有余量时再逐步提高。"
+                        "同时确认主模型与mmproj来自同一模型系列。"
+                    ) from load_error
+                raise RuntimeError(
+                    f"模型加载失败：{size_hint}{estimate_hint}"
+                    f"当前显存预算为 {vram_limit_gb:.1f} GB（n_gpu_layers={n_gpu_layers}）。"
+                    "如果显卡还有空余，请适当提高显存预算；如果仍然显存不足，请降低预算，"
+                    "并关闭其他占用显存的节点或程序。若调整后仍失败，再检查GGUF下载完整性、"
+                    "CUDA后端和主模型/mmproj配对。"
+                ) from load_error
             raise
 
         DapaoLlamaStorage.llm = llm
@@ -469,12 +774,13 @@ class Dapao_LlamaChat:
             "image_min_tokens": image_min_tokens,
             "image_max_tokens": image_max_tokens,
             "think_mode": think_mode,
+            "reasoning_effort": reasoning_effort,
         }
         return llm
 
     def run(self, unique_id, **kwargs):
         model_file       = kwargs["🤖模型文件"]
-        handler_name     = kwargs["🔌对话处理器"]
+        handler_name     = _normalize_handler_name(kwargs["🔌对话处理器"])
         mmproj_file      = kwargs["🖼️mmproj文件"]
         n_ctx            = kwargs["📐上下文长度"]
         vram_limit_gb    = kwargs["💾显存限制(GB)"]
@@ -482,7 +788,6 @@ class Dapao_LlamaChat:
         image_max_tokens = kwargs["🔢图像最大token"]
         system_prompt    = kwargs["📝系统提示词"]
         user_prompt      = kwargs["💬用户提示词"]
-        inference_mode   = kwargs["🎯推理模式"]
         max_frames       = kwargs["🎞️最大帧数"]
         max_size         = kwargs["📏图像最大边长"]
         seed             = kwargs["🎲随机种子"]
@@ -492,6 +797,9 @@ class Dapao_LlamaChat:
         top_k            = kwargs["🔝top_k"]
         repeat_penalty   = kwargs["🔁重复惩罚"]
         think_mode       = kwargs["🧠思考模式"]
+        reasoning_effort = normalize_qwen38_reasoning_effort(
+            kwargs.get("🧠Qwen3.8推理强度", "关闭")
+        )
         save_states      = kwargs["💾保存对话历史"]
         force_offload    = kwargs["⚡推理后卸载模型"]
         uid              = str(unique_id)
@@ -508,6 +816,32 @@ class Dapao_LlamaChat:
 
         # 各 tensor 单独保留，不拼接（不同尺寸图片无法 cat）
         all_image_tensors = [t for t in image_slots + video_slots if t is not None]
+        has_video_input = any(t is not None for t in video_slots)
+        active_audio = [a for a in audio_slots if a is not None]
+        input_frame_count = min(
+            max_frames,
+            sum(int(tensor.shape[0]) for tensor in all_image_tensors),
+        )
+        inference_strategy = _select_inference_strategy(
+            input_frame_count, has_video_input, bool(active_audio), user_prompt,
+        )
+
+        # Qwen3.8 的视觉 token 和输出 token 都占用同一个上下文；旧工作流常保存
+        # 很小的 n_ctx，必须在模型加载前按本次请求自动提高，避免 MTMD Context Shift。
+        if input_frame_count:
+            images_per_request = 1 if inference_strategy == "多图逐张分析" else input_frame_count
+            minimum_n_ctx = image_max_tokens * images_per_request + max_tokens + 512
+            if minimum_n_ctx > 131072:
+                raise ValueError(
+                    "当前图片/视频帧数量与图像最大 token 设置需要超过 131072 的上下文。"
+                    "请降低“最大帧数”或“图像最大token”后重试。"
+                )
+            if n_ctx < minimum_n_ctx:
+                print(
+                    f"[大炮-llama] 自动提高上下文：{n_ctx} -> {minimum_n_ctx} "
+                    f"（策略={inference_strategy}）"
+                )
+                n_ctx = minimum_n_ctx
 
         # ── 加载或复用模型 ────────────────────────────────────────────────────
         need_load = DapaoLlamaStorage.llm is None
@@ -522,13 +856,15 @@ class Dapao_LlamaChat:
                 or cfg.get("image_min_tokens") != image_min_tokens
                 or cfg.get("image_max_tokens") != image_max_tokens
                 or cfg.get("think_mode") != think_mode
+                or cfg.get("reasoning_effort", "xhigh") != reasoning_effort
             )
 
         if need_load:
             DapaoLlamaStorage.clean()
             mm.soft_empty_cache()
             self._load_model(model_file, handler_name, mmproj_file, n_ctx,
-                             vram_limit_gb, image_min_tokens, image_max_tokens, think_mode)
+                             vram_limit_gb, image_min_tokens, image_max_tokens,
+                             think_mode, reasoning_effort)
             DapaoLlamaStorage.clean_state(uid)
         else:
             print("[大炮-llama] 复用已加载模型")
@@ -558,9 +894,10 @@ class Dapao_LlamaChat:
                 break
 
         # 音频输入
-        active_audio = [a for a in audio_slots if a is not None]
         if active_audio:
             print(f"[大炮-llama] 检测到 {len(active_audio)} 个音频输入")
+        if frame_list:
+            print(f"[大炮-llama] 检测到 {len(frame_list)} 张图像/视频帧，最大处理数={max_frames}")
 
         _params = dict(
             max_tokens=max_tokens,
@@ -571,7 +908,7 @@ class Dapao_LlamaChat:
             seed=seed,
         )
 
-        def _infer(msgs, pil_frames, audio_list=None):
+        def _infer(msgs, pil_frames, audio_list=None, image_index=None, image_total=None):
             user_content = []
             for pil_img in pil_frames:
                 b64 = image2base64(pil_img)
@@ -589,7 +926,16 @@ class Dapao_LlamaChat:
                         })
                     except Exception as e:
                         print(f"[大炮-llama] 音频编码失败: {e}")
-            user_content.append({"type": "text", "text": user_prompt})
+            prompt_text = user_prompt
+            if image_index is not None and image_total is not None:
+                prompt_text = (
+                    f"这是一个多图逐张分析任务。当前正在分析第 {image_index}/{image_total} 张图片。"
+                    "本次请求只附带当前这一张图片，这是预期行为，不是漏传图片。"
+                    "请直接分析当前图片，不要回复‘只收到一张图片’、不要要求重新上传，"
+                    f"并在回答开头标注‘图片 {image_index}/{image_total}’。\n\n"
+                    f"用户要求：{user_prompt}"
+                )
+            user_content.append({"type": "text", "text": prompt_text})
             msgs.append({"role": "user", "content": user_content})
             mm.throw_exception_if_processing_interrupted()
             resp = llm.create_chat_completion(messages=msgs, **_params)
@@ -608,16 +954,20 @@ class Dapao_LlamaChat:
             msgs.append({"role": "assistant", "content": text})
             return text
 
-        # ── 推理 ──────────────────────────────────────────────────────────────
-        print(f"[大炮-llama] 推理开始  seed={seed}  模式={inference_mode}")
+        print(f"[大炮-llama] 推理开始  seed={seed}  自动策略={inference_strategy}")
 
-        if inference_mode == "one by one" and frame_list:
+        if inference_strategy == "多图逐张分析":
             replies = []
-            for pil_img in cqdm(frame_list, desc="逐帧推理"):
+            total_frames = len(frame_list)
+            for image_index, pil_img in enumerate(cqdm(frame_list, desc="逐帧推理"), start=1):
                 frame_msgs = [{"role": "system", "content": system_prompt}]
-                # one by one 模式：音频只在第一帧附带，避免重复
+                # 逐张模式中音频只在第一张附带，避免重复发送。
                 audio_arg = active_audio if replies == [] else None
-                replies.append(_infer(frame_msgs, [pil_img], audio_arg))
+                result = _infer(
+                    frame_msgs, [pil_img], audio_arg,
+                    image_index=image_index, image_total=total_frames,
+                )
+                replies.append(f"【图片 {image_index}/{total_frames}】\n{result}")
             reply = "\n\n".join(replies)
             messages.append({"role": "user", "content": [{"type": "text", "text": user_prompt}]})
             messages.append({"role": "assistant", "content": reply})
@@ -635,7 +985,7 @@ class Dapao_LlamaChat:
             print("[大炮-llama] 卸载模型")
             DapaoLlamaStorage.clean()
             mm.soft_empty_cache()
-        elif handler_name in ("Qwen3.5", "Qwen3.5-Thinking", "Qwen3-VL", "Qwen3-VL-Thinking"):
+        elif handler_name in ("Qwen3.8", "Qwen3.5", "Qwen3.5-Thinking", "Qwen3-VL", "Qwen3-VL-Thinking"):
             # 这些模型需要手动清空 KV cache，否则下次推理会出错
             try:
                 llm.n_tokens = 0

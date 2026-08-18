@@ -21,7 +21,8 @@ from .cqdm import cqdm
 from .caption_options import Dapao_LlamaCaptionOptions
 # 复用主节点的存储和工具函数
 from .nodes import (
-    DapaoLlamaStorage, CHAT_HANDLERS, AnyType,
+    DapaoLlamaStorage, CHAT_HANDLERS, AnyType, QWEN38_REASONING_OPTIONS,
+    normalize_qwen38_reasoning_effort,
     tensor2pil, scale_image, image2base64,
 )
 
@@ -100,6 +101,7 @@ class Dapao_LlamaCaption:
                 "🔝top_k": ("INT", {"default": 40, "min": 0, "max": 200, "step": 1}),
                 "🔁重复惩罚": ("FLOAT", {"default": 1.1, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "🧠思考模式": ("BOOLEAN", {"default": False}),
+                "🧠Qwen3.8推理强度": (QWEN38_REASONING_OPTIONS, {"default": "关闭", "tooltip": "仅 Qwen3.8 生效；关闭=不思考，自动/高=模型最高档，低/中等=降低思考强度。"}),
                 "⚡推理后卸载模型": ("BOOLEAN", {"default": False}),
             },
             "optional": {
@@ -175,6 +177,7 @@ class Dapao_LlamaCaption:
             "image_min_tokens": image_min_tokens,
             "image_max_tokens": image_max_tokens,
             "think_mode": think_mode,
+            "reasoning_effort": normalize_qwen38_reasoning_effort(kwargs.get("🧠Qwen3.8推理强度", "关闭")),
         }
         need_load = DapaoLlamaStorage.llm is None or DapaoLlamaStorage.current_config != load_config
 
@@ -182,7 +185,8 @@ class Dapao_LlamaCaption:
             DapaoLlamaStorage.clean()
             mm.soft_empty_cache()
             _load_llm(model_file, handler_name, mmproj_file, n_ctx,
-                      vram_limit_gb, image_min_tokens, image_max_tokens, think_mode)
+                      vram_limit_gb, image_min_tokens, image_max_tokens, think_mode,
+                      load_config["reasoning_effort"])
         else:
             print("[大炮-llama] 复用已加载模型")
 
@@ -232,7 +236,7 @@ class Dapao_LlamaCaption:
         if force_offload:
             DapaoLlamaStorage.clean()
             mm.soft_empty_cache()
-        elif handler_name in ("Qwen3.5", "Qwen3.5-Thinking", "Qwen3-VL", "Qwen3-VL-Thinking"):
+        elif handler_name in ("Qwen3.8", "Qwen3.5", "Qwen3.5-Thinking", "Qwen3-VL", "Qwen3-VL-Thinking"):
             try:
                 llm.n_tokens = 0
                 llm._ctx.memory_clear(True)
@@ -261,12 +265,13 @@ def _infer_single_text(llm, prompt, params, think_mode):
 
 
 def _load_llm(model_file, handler_name, mmproj_file, n_ctx, vram_limit_gb,
-              image_min_tokens, image_max_tokens, think_mode):
+              image_min_tokens, image_max_tokens, think_mode, reasoning_effort="off"):
     """复用 nodes.py 的加载逻辑"""
     from .nodes import Dapao_LlamaChat
     node = Dapao_LlamaChat()
     node._load_model(model_file, handler_name, mmproj_file, n_ctx,
-                     vram_limit_gb, image_min_tokens, image_max_tokens, think_mode)
+                     vram_limit_gb, image_min_tokens, image_max_tokens, think_mode,
+                     reasoning_effort)
 
 
 NODE_CLASS_MAPPINGS_CAPTION = {

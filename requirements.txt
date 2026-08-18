@@ -1,22 +1,14 @@
-# ComfyUI-llama_Dapao 依赖说明
-#
-# llama-cpp-python 需要手动安装带 GPU 加速的预编译版本
-# 请从以下地址下载对应你 CUDA 版本的 wheel 文件：
-#   https://github.com/JamePeng/llama-cpp-python/releases
-#
-# 示例（CUDA 12.8，Windows）：
-#   pip install llama_cpp_python-0.3.35+cu128-cp311-cp311-win_amd64.whl
-#
-# 最低版本要求：
-#   0.3.35+  — 支持 Gemma4、LFM2-VL 等新模型架构
-#   0.3.34   — 不支持 Gemma4（会报 Failed to load model from file）
-#
-# 注意：不要用 pip install llama-cpp-python 安装 CPU 版本，GPU 推理速度差异极大
+# Qwen3.8 requires a llama.cpp backend with MTP/NextN tensor support.
+# PyPI currently stops at 0.3.35, so use the maintained fork at a tested commit.
+# This PEP 508 dependency is portable and does not contain a local Python path.
+llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git@4854c7d305650b6bc9cf2dc805931a5bf2e40dd0
 
-# Python 标准库（无需安装）：os, io, gc, json, base64, struct, sys
+# Source installation builds the CPU backend by default. GPU users should install
+# a matching 0.3.47+ wheel from the release page before installing this node:
+# https://github.com/JamePeng/llama-cpp-python/releases
 
-# 第三方依赖（ComfyUI 环境通常已自带）
 numpy>=1.24.0
 Pillow>=9.0.0
 torch>=2.0.0
 tqdm>=4.60.0
+requests>=2.31.0

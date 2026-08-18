@@ -47,6 +47,19 @@
 ### 🍭 llama视频反推
 ![alt text](image-3.png)
 
+### 🍬 大炮API常用工具（本地LLM版）
+
+项目同时提供参考自 `ComfyUI-dapaoAPI` 的 7 个常用提示词工具，全部改为调用本节点选择的本地 GGUF 模型，不需要 API Key：
+
+- 电商详情页提示词
+- H3 专用提示词框与 H3 视频提示词生成
+- 全能 image 提示词生成
+- Music3 音乐提示词生成
+- Seedance2 全能导演
+- 全能视觉风格提示词
+
+这些节点保留原工具的输入、媒体分析、结构化校验和输出口；节点中的本地模型、处理器、mmproj、上下文、显存和推理参数通过 `folder_paths` 动态读取。视觉模型请同时选择匹配的主模型和 mmproj，批量图片会在同一次本地推理中逐一传递给模型。
+
 ## 支持的模型/处理器
 
 | 处理器 | 说明 |
@@ -56,28 +69,40 @@
 | Moondream2 | 轻量视觉模型 |
 | MiniCPM-v2.6 / v4.5 | MiniCPM 视觉模型 |
 | Gemma3 / Gemma4 | Google Gemma 视觉模型 |
+| Qwen3.8 | Qwen3.8-VL 多模态模型，需要匹配的 mmproj |
 | Qwen2.5-VL / Qwen3-VL | Qwen 视觉模型 |
 | Qwen3.5 | Qwen3.5 多模态模型 |
 | GLM-4.6V / GLM-4.1V | 智谱 GLM 视觉模型 |
 | LFM2-VL | Liquid 视觉模型 |
 | Granite-Docling | 文档理解模型 |
 
+Qwen3.8 官方定位为统一视觉语言模型，GGUF 架构标识为 `qwen35`。主模型和对应 mmproj 都放入 `ComfyUI/models/LLM/`；节点选择 `Qwen3.8` 后可直接进行图像、视频帧和文本推理。推理强度已中文化为“关闭、自动、低、中等、高”，默认关闭；其中“自动/高”对应模型原生的 `xhigh`。
+
 带 `-Thinking` 后缀的处理器默认开启思考模式。
 
 ## 安装
 
-### 1. 安装 llama-cpp-python（GPU 版本）
+### 1. 安装依赖
 
-**不要** 用 `pip install llama-cpp-python` 安装 CPU 版本，GPU 推理速度差异极大。
+ComfyUI Manager 会读取项目根目录的 `requirements.txt`。依赖使用标准的 Git 源声明，不包含整合包或便携 Python 的固定路径。
 
-从 [JamePeng/llama-cpp-python](https://github.com/JamePeng/llama-cpp-python/releases) 下载对应 CUDA 版本的预编译 wheel：
+Qwen3.8 至少需要 JamePeng `llama-cpp-python 0.3.47+`。旧版 `0.3.35` 无法加载带 MTP/NextN 层的 Qwen3.8 GGUF，典型底层错误为：
 
-```bash
-# 示例：CUDA 12.8，Python 3.11，Windows
-pip install llama_cpp_python-0.3.35+cu128-cp311-cp311-win_amd64.whl
+```text
+missing tensor 'blk.64.ssm_conv1d.weight'
 ```
 
-最低版本要求：`0.3.35+`（支持 Gemma4、LFM2-VL 等新架构）
+CPU 用户可直接通过 `requirements.txt` 从源码安装。NVIDIA GPU 用户可先完成节点依赖安装，再从 [JamePeng/llama-cpp-python Releases](https://github.com/JamePeng/llama-cpp-python/releases) 下载与操作系统、Python 版本和 CUDA 版本完全匹配的 `0.3.47+` wheel 覆盖源码构建结果。
+
+便携 Python 的通用安装方式如下，`python.exe` 应替换为当前 ComfyUI 实际使用的 Python，可在节点报错末尾看到该路径：
+
+```bash
+python.exe -m pip install -r requirements.txt
+# NVIDIA GPU：安装完 requirements 后，用匹配的 GPU wheel 覆盖源码构建结果
+python.exe -m pip install --upgrade --force-reinstall <下载的wheel文件.whl>
+```
+
+安装完成后必须重启 ComfyUI。不要只按显卡驱动显示的最高 CUDA 版本选择 wheel，还要确认 wheel 自带的 CUDA 运行库与当前环境兼容。
 
 ### 2. 模型文件
 

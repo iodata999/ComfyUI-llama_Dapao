@@ -22,6 +22,8 @@ from .nodes import (
     CHAT_HANDLERS,
     DapaoLlamaStorage,
     Dapao_LlamaChat,
+    QWEN38_REASONING_OPTIONS,
+    normalize_qwen38_reasoning_effort,
     image2base64,
     scale_image,
     tensor2pil,
@@ -205,6 +207,7 @@ class Dapao_LlamaBatchPrompt:
                 "🔝top_k": ("INT", {"default": 40, "min": 0, "max": 200, "step": 1}),
                 "🔁重复惩罚": ("FLOAT", {"default": 1.1, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "🧠思考模式": ("BOOLEAN", {"default": False}),
+                "🧠Qwen3.8推理强度": (QWEN38_REASONING_OPTIONS, {"default": "关闭", "tooltip": "仅 Qwen3.8 生效；关闭=不思考，自动/高=模型最高档，低/中等=降低思考强度。"}),
                 "⚡推理后卸载模型": ("BOOLEAN", {"default": False}),
             },
             "optional": {
@@ -507,7 +510,7 @@ class Dapao_LlamaBatchPrompt:
     def _extract_response_text(resp):
         return (resp["choices"][0]["message"]["content"] or "").removeprefix(": ").lstrip()
 
-    def _ensure_model(self, model_file, handler_name, mmproj_file, n_ctx, vram_limit_gb, image_min_tokens, image_max_tokens, think_mode):
+    def _ensure_model(self, model_file, handler_name, mmproj_file, n_ctx, vram_limit_gb, image_min_tokens, image_max_tokens, think_mode, reasoning_effort="off"):
         load_config = {
             "model_file": model_file,
             "handler_name": handler_name,
@@ -517,6 +520,7 @@ class Dapao_LlamaBatchPrompt:
             "image_min_tokens": image_min_tokens,
             "image_max_tokens": image_max_tokens,
             "think_mode": think_mode,
+            "reasoning_effort": reasoning_effort,
         }
         need_load = DapaoLlamaStorage.llm is None or DapaoLlamaStorage.current_config != load_config
         if need_load:
@@ -531,6 +535,7 @@ class Dapao_LlamaBatchPrompt:
                 image_min_tokens,
                 image_max_tokens,
                 think_mode,
+                reasoning_effort,
             )
         else:
             _log_info("复用已加载模型")
@@ -538,7 +543,7 @@ class Dapao_LlamaBatchPrompt:
 
     @staticmethod
     def _clear_local_cache_if_needed(llm, handler_name):
-        if handler_name in ("Qwen3.5", "Qwen3.5-Thinking", "Qwen3-VL", "Qwen3-VL-Thinking"):
+        if handler_name in ("Qwen3.8", "Qwen3.5", "Qwen3.5-Thinking", "Qwen3-VL", "Qwen3-VL-Thinking"):
             try:
                 llm.n_tokens = 0
                 llm._ctx.memory_clear(True)
@@ -770,7 +775,8 @@ class Dapao_LlamaBatchPrompt:
         }
 
         start_time = time.time()
-        llm = self._ensure_model(model_file, handler_name, mmproj_file, n_ctx, vram_limit_gb, image_min_tokens, image_max_tokens, think_mode)
+        reasoning_effort = normalize_qwen38_reasoning_effort(kwargs.get("🧠Qwen3.8推理强度", "关闭"))
+        llm = self._ensure_model(model_file, handler_name, mmproj_file, n_ctx, vram_limit_gb, image_min_tokens, image_max_tokens, think_mode, reasoning_effort)
 
         groups = {}
         source_report = {}
