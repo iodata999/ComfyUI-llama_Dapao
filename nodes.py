@@ -5,6 +5,7 @@ import json
 import base64
 import re
 import sys
+import inspect
 
 import numpy as np
 import torch
@@ -32,6 +33,11 @@ any_type = AnyType("*")
 # ── 按需 import 各 ChatHandler（兼容不同版本 llama-cpp-python）──────────────
 import llama_cpp
 from llama_cpp import Llama
+
+try:
+    from llama_cpp import GGML_TYPE_Q8_0
+except Exception:
+    GGML_TYPE_Q8_0 = 8
 from llama_cpp.llama_chat_format import (
     Llava15ChatHandler, Llava16ChatHandler, MoondreamChatHandler,
     NanoLlavaChatHandler, Llama3VisionAlphaChatHandler, MiniCPMv26ChatHandler,
@@ -128,6 +134,9 @@ _QWEN_ARCHITECTURE_HANDLERS = {
 
 _QWEN38_MIN_LLAMA_CPP_VERSION = (0, 3, 47)
 QWEN38_REASONING_OPTIONS = ["关闭", "自动", "低", "中等", "高"]
+KV_CACHE_DEFAULT = "默认(F16)"
+KV_CACHE_Q8_0 = "Q8_0（更省显存）"
+KV_CACHE_OPTIONS = [KV_CACHE_DEFAULT, KV_CACHE_Q8_0]
 _QWEN38_REASONING_VALUES = {
     "关闭": "off",
     "自动": "xhigh",
@@ -166,6 +175,21 @@ def normalize_qwen38_reasoning_effort(value):
         return _QWEN38_REASONING_VALUES[str(value)]
     except KeyError as error:
         raise ValueError(f"未知 Qwen3.8 推理强度：{value}") from error
+
+
+def _llama_constructor_supports(name):
+    try:
+        return name in inspect.signature(Llama.__init__).parameters
+    except Exception:
+        return None
+
+
+def _parse_kv_cache_type(value):
+    if value in (None, "", KV_CACHE_DEFAULT, "默认", "F16"):
+        return None
+    if value in (KV_CACHE_Q8_0, "q8_0", "Q8_0"):
+        return GGML_TYPE_Q8_0
+    raise ValueError(f"未知 KV 缓存类型：{value}")
 
 
 def _validate_qwen38_backend():
@@ -221,7 +245,15 @@ def _validate_multimodal_pair(model_path, model_file, handler_name, mmproj_path,
     model_arch = model_info["architecture"]
     expected_arch = _QWEN_HANDLER_ARCHITECTURES.get(handler_name)
 
-    if expected_arch and model_arch and model_arch != expected_arch:
+    architecture_matches = (
+        model_arch == expected_arch
+        or (
+            expected_arch == "qwen35"
+            and isinstance(model_arch, str)
+            and model_arch.startswith("qwen35")
+        )
+    )
+    if expected_arch and model_arch and not architecture_matches:
         recommended = _QWEN_ARCHITECTURE_HANDLERS.get(model_arch)
         recommendation = f"，该主模型应选择“{recommended}”" if recommended else ""
         raise ValueError(
@@ -255,11 +287,29 @@ class DapaoLlamaStorage:
 
     @classmethod
     def clean(cls, all=False):
-        if cls.llm is not None:
-            del cls.llm
-            cls.llm = None
+        llm = cls.llm
+        chat_handler = cls.chat_handler
+        attached_handler = getattr(llm, "chat_handler", None) if llm is not None else None
+        cls.llm = None
         cls.chat_handler = None
         cls.current_config = None
+        llm_closed = False
+        if llm is not None and hasattr(llm, "close"):
+            try:
+                llm.close()
+                llm_closed = True
+            except Exception as error:
+                print(f"[大炮-llama] 关闭模型时出现警告：{error}")
+        if (
+            chat_handler is not None
+            and hasattr(chat_handler, "close")
+            and (chat_handler is not attached_handler or not llm_closed)
+        ):
+            try:
+                chat_handler.close()
+            except Exception as error:
+                print(f"[大炮-llama] 关闭多模态处理器时出现警告：{error}")
+        del llm, chat_handler, attached_handler
         if all:
             cls.messages = {}
             cls.sys_prompts = {}
@@ -508,7 +558,10 @@ class Dapao_LlamaChat:
 
     def _load_model(self, model_file, handler_name, mmproj_file, n_ctx, vram_limit_gb,
                     image_min_tokens, image_max_tokens, think_mode=False,
-                    reasoning_effort="off"):
+                    reasoning_effort="off", *, n_gpu_layers_override=None,
+                    cache_type_k=KV_CACHE_DEFAULT, cache_type_v=KV_CACHE_DEFAULT,
+                    preserve_thinking=False, cpu_moe=False, n_cpu_moe=0,
+                    model_family=None):
         handler_name = _normalize_handler_name(handler_name)
         reasoning_effort = normalize_qwen38_reasoning_effort(reasoning_effort)
         model_path = os.path.join(folder_paths.models_dir, "LLM", model_file)
@@ -523,10 +576,10 @@ class Dapao_LlamaChat:
             model_path, model_file, handler_name, mmproj_path, mmproj_file
         )
 
-        # ── n_gpu_layers 计算（与参考节点一致，含 1.55 系数）────────────────
+        # 单节点旧界面仍可按显存预算换算；多轮加载器直接传 GPU 层数，避免猜测。
         layer_count = get_layer_count(model_path) or 32
-        n_gpu_layers = -1
-        if vram_limit_gb != -1:
+        n_gpu_layers = -1 if n_gpu_layers_override is None else int(n_gpu_layers_override)
+        if n_gpu_layers_override is None and vram_limit_gb != -1:
             model_size_gb = os.path.getsize(model_path) * 1.55 / (1024 ** 3)
             layer_size_gb = model_size_gb / layer_count
 
@@ -581,10 +634,17 @@ class Dapao_LlamaChat:
                 if Qwen35ChatHandler is None:
                     raise RuntimeError("Qwen35ChatHandler 未找到，请升级 llama-cpp-python")
                 kwargs["enable_thinking"] = think_mode
+                kwargs["preserve_thinking"] = bool(preserve_thinking)
                 if _MTMD:
                     kwargs["image_max_tokens"] = image_max_tokens
                     kwargs["image_min_tokens"] = image_min_tokens
-                chat_handler = Qwen35ChatHandler(**kwargs)
+                try:
+                    chat_handler = Qwen35ChatHandler(**kwargs)
+                except TypeError as error:
+                    if "preserve_thinking" not in str(error):
+                        raise
+                    kwargs.pop("preserve_thinking", None)
+                    chat_handler = Qwen35ChatHandler(**kwargs)
 
             elif handler_name in ("MiniCPM-v4.5", "MiniCPM-v4.5-Thinking"):
                 kwargs["enable_thinking"] = think_mode
@@ -663,13 +723,68 @@ class Dapao_LlamaChat:
         # ── 加载 Llama ────────────────────────────────────────────────────────
         llm = None
         try:
-            llm = Llama(
-                model_path=model_path,
-                chat_handler=chat_handler,
-                n_gpu_layers=n_gpu_layers,
-                n_ctx=n_ctx,
-                verbose=False,
+            llama_kwargs = {
+                "model_path": model_path,
+                "chat_handler": chat_handler,
+                "n_gpu_layers": n_gpu_layers,
+                "n_ctx": n_ctx,
+                "verbose": False,
+            }
+            if _llama_constructor_supports("ctx_checkpoints") is not False:
+                llama_kwargs["ctx_checkpoints"] = 0
+
+            type_k = _parse_kv_cache_type(cache_type_k)
+            type_v = _parse_kv_cache_type(cache_type_v)
+            wants_custom_kv = type_k is not None or type_v is not None
+            if wants_custom_kv and (
+                _llama_constructor_supports("type_k") is False
+                or _llama_constructor_supports("type_v") is False
+            ):
+                raise RuntimeError(
+                    "当前 llama-cpp-python 不支持 KV 缓存量化参数 type_k/type_v。"
+                    "请升级依赖，或把 K/V 缓存类型改回“默认(F16)”。"
+                )
+            if type_k is not None:
+                llama_kwargs["type_k"] = type_k
+            if type_v is not None:
+                llama_kwargs["type_v"] = type_v
+
+            if model_family == "Qwen3.6-VL":
+                wants_cpu_moe = bool(cpu_moe)
+                wants_n_cpu_moe = int(n_cpu_moe or 0) > 0 and not wants_cpu_moe
+                if wants_cpu_moe:
+                    if _llama_constructor_supports("cpu_moe") is False:
+                        raise RuntimeError(
+                            "当前 llama-cpp-python 不支持 MoE专家上CPU（cpu_moe）。"
+                            "请升级依赖或关闭该选项。"
+                        )
+                    llama_kwargs["cpu_moe"] = True
+                elif wants_n_cpu_moe:
+                    if _llama_constructor_supports("n_cpu_moe") is False:
+                        raise RuntimeError(
+                            "当前 llama-cpp-python 不支持前N层专家上CPU（n_cpu_moe）。"
+                            "请升级依赖或把该参数设为0。"
+                        )
+                    llama_kwargs["n_cpu_moe"] = int(n_cpu_moe)
+
+            llm = Llama(**llama_kwargs)
+            try:
+                gpu_available = bool(llama_cpp.llama_supports_gpu_offload())
+            except Exception:
+                gpu_available = None
+            print(
+                f"[大炮-llama] 运行后端：GPU卸载="
+                f"{'可用' if gpu_available is True else '不可用' if gpu_available is False else '未知'}，"
+                f"GPU层数={n_gpu_layers}，KV-K={cache_type_k}，KV-V={cache_type_v}，"
+                "ctx_checkpoints=0",
+                flush=True,
             )
+            if gpu_available is False and n_gpu_layers != 0:
+                print(
+                    "[大炮-llama] 警告：请求了GPU层，但CUDA后端未成功加载；"
+                    "本轮可能退回CPU，请检查ggml-cuda.dll及其CUDA运行库。",
+                    flush=True,
+                )
 
             if handler_name == "Qwen3.8":
                 chat_template = (getattr(llm, "metadata", {}) or {}).get(
@@ -681,7 +796,7 @@ class Dapao_LlamaChat:
                     chat_handler = _create_qwen38_mm_handler(
                         mmproj_path,
                         enable_thinking=think_mode and reasoning_effort != "off",
-                        preserve_thinking=False,
+                        preserve_thinking=bool(preserve_thinking),
                         reasoning_effort=reasoning_effort,
                         chat_template_override=_adapt_qwen38_chat_template(chat_template),
                         image_min_tokens=image_min_tokens,
@@ -691,7 +806,7 @@ class Dapao_LlamaChat:
                     chat_handler = _create_qwen38_text_handler(
                         llm,
                         enable_thinking=think_mode and reasoning_effort != "off",
-                        preserve_thinking=False,
+                        preserve_thinking=bool(preserve_thinking),
                         reasoning_effort=reasoning_effort,
                     )
                 llm.chat_handler = chat_handler
@@ -745,6 +860,24 @@ class Dapao_LlamaChat:
                     f"粗略加载预算约 {estimated:.1f} GB（还未计入上下文缓存）。"
                     if estimated is not None else ""
                 )
+                if n_gpu_layers_override is not None and n_gpu_layers == -1:
+                    raise RuntimeError(
+                        f"模型加载失败：{size_hint}{estimate_hint}"
+                        "当前“GPU层数”为 -1，表示尽可能把全部模型层放入GPU。"
+                        "如果日志同时出现 CUDA 内存不足，请改成较小的正数，让部分层转到系统内存；"
+                        "如果加载几乎立刻失败且没有显存不足提示，请检查GGUF是否完整、"
+                        "llama-cpp-python GPU版本是否正确，以及主模型与mmproj是否配套。"
+                    ) from load_error
+                if n_gpu_layers_override is not None:
+                    layer_hint = (
+                        "当前为纯CPU加载；该错误通常不是显存不足，请优先检查模型文件和依赖。"
+                        if n_gpu_layers == 0
+                        else f"当前GPU层数为 {n_gpu_layers}；若显存不足请降低该数值，若显存充足可提高以加速。"
+                    )
+                    raise RuntimeError(
+                        f"模型加载失败：{size_hint}{estimate_hint}{layer_hint}"
+                        "同时确认GGUF下载完整、CUDA后端可用，且主模型与mmproj来自同一模型系列和参数规模。"
+                    ) from load_error
                 if n_gpu_layers == -1:
                     raise RuntimeError(
                         f"模型加载失败：{size_hint}{estimate_hint}"
@@ -775,6 +908,13 @@ class Dapao_LlamaChat:
             "image_max_tokens": image_max_tokens,
             "think_mode": think_mode,
             "reasoning_effort": reasoning_effort,
+            "n_gpu_layers": n_gpu_layers,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v,
+            "preserve_thinking": bool(preserve_thinking),
+            "cpu_moe": bool(cpu_moe),
+            "n_cpu_moe": int(n_cpu_moe or 0),
+            "model_family": model_family,
         }
         return llm
 
