@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import gc
 import io
 import json
@@ -19,7 +20,20 @@ from .nodes import (
     DapaoLlamaStorage, Dapao_LlamaChat, QWEN38_REASONING_OPTIONS,
     KV_CACHE_DEFAULT, KV_CACHE_OPTIONS, normalize_qwen38_reasoning_effort,
 )
-from .skill_loader_node import get_skill, list_skills, read_reference, read_skill
+from .skill_runtime import (
+    api_messages,
+    build_skill_prompt,
+    current_message_content,
+    get_skill,
+    list_skills,
+    normalize_history,
+    normalize_image_refs,
+    normalize_state,
+    parse_skill_reply,
+    read_reference,
+    read_skill,
+    select_material_mentions,
+)
 
 
 STATE_TAG = re.compile(r"<dapao_local_skill_state>\s*(\{.*?\})\s*</dapao_local_skill_state>", re.S)
@@ -66,6 +80,13 @@ def _clean_reply(text: str) -> str:
     value = str(text or "").strip()
     match = re.search(r"<think>.*?</think>(.*)", value, re.S)
     return match.group(1).strip() if match else value
+
+
+def _latest_assistant_reply(history: list[dict]) -> str:
+    for item in reversed(history):
+        if item.get("role") == "assistant" and isinstance(item.get("content"), str):
+            return item["content"]
+    return ""
 
 
 def _json(raw, fallback):
@@ -511,6 +532,89 @@ def _release_model(model):
     print("[大炮-llama] 已按设置卸载模型与多模态处理器，并释放显存")
 
 
+def _material_aliases(raw) -> dict[str, str]:
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        value = raw
+    else:
+        text = str(raw).strip()
+        try:
+            value = json.loads(text or "{}")
+        except json.JSONDecodeError:
+            value = {}
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                key, separator, label = line.partition("=")
+                if not separator:
+                    raise ValueError("素材别名格式错误，请使用JSON，或每行填写“图片1=产品正面”。")
+                value[key.strip()] = label.strip()
+    if not isinstance(value, dict):
+        raise ValueError("素材别名必须是JSON对象。")
+    result = {}
+    for key, label in value.items():
+        normalized_key = str(key or "").strip().lstrip("@")
+        normalized_label = str(label or "").strip().lstrip("@")
+        if normalized_key and normalized_label:
+            result[normalized_key] = normalized_label[:80]
+    if len(set(result.values())) != len(result):
+        raise ValueError("素材别名不能重复，否则@菜单无法区分。")
+    return result
+
+
+class DapaoLocalChatMaterialLibrary:
+    CATEGORY = CATEGORY
+    RETURN_TYPES = ("DAPAO_LOCAL_CHAT_MATERIAL_LIBRARY",)
+    RETURN_NAMES = ("📦多轮对话素材库",)
+    FUNCTION = "build_library"
+    DESCRIPTION = "登记最多20图、5视频、5音频；只有聊天框本轮明确@引用的素材才会被处理并传给本地模型。"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {}
+        for index in range(1, 21):
+            optional[f"🖼️图片{index}"] = ("IMAGE", {"tooltip": f"待引用图片{index}；每个接口只连接单张IMAGE。"})
+        for index in range(1, 6):
+            optional[f"🎞️视频{index}"] = ("VIDEO", {"tooltip": f"只有本轮@视频{index}时才抽取代表帧。"})
+            optional[f"🎵音频{index}"] = ("AUDIO", {"tooltip": f"只有本轮@音频{index}时才压缩为16kHz单声道WAV。"})
+        return {
+            "required": {
+                "🏷️素材别名": ("STRING", {
+                    "default": "{}",
+                    "multiline": True,
+                    "tooltip": "可选。JSON示例：{\"图片1\":\"产品正面\",\"视频1\":\"开场镜头\"}。固定编号始终是内部稳定ID。",
+                }),
+            },
+            "optional": optional,
+        }
+
+    def build_library(self, **kwargs):
+        aliases = _material_aliases(kwargs.get("🏷️素材别名"))
+        items = []
+        specs = (("image", "图片", "🖼️图片", 20), ("video", "视频", "🎞️视频", 5), ("audio", "音频", "🎵音频", 5))
+        for kind, chinese, prefix, limit in specs:
+            for slot in range(1, limit + 1):
+                value = kwargs.get(f"{prefix}{slot}")
+                if value is None:
+                    continue
+                token = f"@{chinese}{slot}"
+                if kind == "image":
+                    if not hasattr(value, "shape") or len(value.shape) != 4:
+                        raise ValueError(f"{token}必须连接ComfyUI IMAGE。")
+                    if int(value.shape[0]) != 1:
+                        raise ValueError(f"{token}包含{int(value.shape[0])}张图片；请先拆分批次，每个素材接口只接一张。")
+                key = f"{chinese}{slot}"
+                items.append({
+                    "kind": kind,
+                    "slot": slot,
+                    "token": token,
+                    "label": aliases.get(key, token),
+                    "value": value,
+                })
+        return ({"version": 1, "items": items},)
+
+
 class DapaoLocalModelLoader:
     CATEGORY = CATEGORY
     RETURN_TYPES = ("DAPAO_LOCAL_MODEL",)
@@ -583,74 +687,130 @@ class DapaoLocalModelLoader:
 
 class DapaoMultiTurnChat:
     CATEGORY = CATEGORY
-    RETURN_TYPES = ()
-    RETURN_NAMES = ()
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("💬助手回复", "📚会话历史JSON", "🧩Skill最终结果")
     FUNCTION = "run"
     OUTPUT_NODE = True
+    DESCRIPTION = "本地llama多轮对话工作台：支持Skill、历史和@素材库；素材只在本轮明确@时进入推理。"
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
-            "🤖本地模型": ("DAPAO_LOCAL_MODEL",),
-            "💬本轮消息": ("STRING", {"default": "", "multiline": True}),
-            "📚会话历史": ("STRING", {"default": "[]", "multiline": True}),
-            "🖼️图片引用": ("STRING", {"default": "[]", "multiline": True}),
-            "🧩流程状态": ("STRING", {"default": "{}", "multiline": True}),
-            "🧩选项": ("STRING", {"default": "[]", "multiline": True}),
-            "🆔请求标识": ("STRING", {"default": ""}),
-        }, "optional": {"⚙️对话设置": ("DAPAO_CHAT_SETTINGS",), "🧩Skill配置": ("DAPAO_SKILL_CONFIG",)}, "hidden": {"unique_id": "UNIQUE_ID"}}
+        return {
+            "required": {
+                "💬本轮消息": ("STRING", {"default": "", "multiline": True}),
+                "📚会话历史": ("STRING", {"default": "[]", "multiline": True}),
+                "🖼️图片引用": ("STRING", {"default": "[]", "multiline": True}),
+                "🧩流程状态": ("STRING", {"default": "{}", "multiline": True}),
+                "🧩选项": ("STRING", {"default": "[]", "multiline": True}),
+                "🆔请求标识": ("STRING", {"default": ""}),
+                "🧭执行动作": ("STRING", {"default": "chat"}),
+            },
+            "optional": {
+                "🤖本地模型": ("DAPAO_LOCAL_MODEL",),
+                "⚙️对话设置": ("DAPAO_CHAT_SETTINGS",),
+                "🧩Skill配置": ("DAPAO_SKILL_CONFIG",),
+                "📦素材库": ("DAPAO_LOCAL_CHAT_MATERIAL_LIBRARY",),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
 
-    def run(self, **kwargs):
+    async def run(self, **kwargs):
+        return await asyncio.to_thread(self._run_with_cleanup, kwargs)
+
+    def _run_with_cleanup(self, kwargs):
         source_model = kwargs.get("🤖本地模型")
+        action = str(kwargs.get("🧭执行动作") or "chat").strip().lower()
         try:
             return self._run(**kwargs)
         finally:
-            if _should_unload(source_model):
+            if action != "publish_final" and _should_unload(source_model):
                 _release_model(source_model)
 
     def _run(self, **kwargs):
-        history = _history(kwargs.get("📚会话历史", "[]"))
+        display_history = normalize_history(kwargs.get("📚会话历史", "[]"))
         user_text = str(kwargs.get("💬本轮消息") or "").strip()
-        current_images = _image_refs(kwargs.get("🖼️图片引用", "[]"))
-        state = _state(kwargs.get("🧩流程状态", "{}"))
+        state = normalize_state(kwargs.get("🧩流程状态", "{}"))
         flow_before = {**state, "loaded_references": list(state["loaded_references"])}
+        action = str(kwargs.get("🧭执行动作") or "chat").strip().lower()
+        if action == "publish_final":
+            reply = _latest_assistant_reply(display_history)
+            raw_options = _json(kwargs.get("🧩选项", "[]"), [])
+            options = [str(item)[:240] for item in raw_options[:6] if str(item).strip()] if isinstance(raw_options, list) else []
+            return self._result(display_history, reply, state, options, False, {})
+
+        current_images = normalize_image_refs(kwargs.get("🖼️图片引用", "[]"))
+        if not user_text and current_images:
+            user_text = "请分析上传的图片，并根据当前对话或Skill继续处理。"
+        if not user_text:
+            return self._result(display_history, _latest_assistant_reply(display_history), state, [], False, {})
+
+        source_settings = _model_settings(kwargs.get("🤖本地模型"))
         settings = kwargs.get("⚙️对话设置") or {}
         settings = settings if isinstance(settings, dict) else {}
-        max_rounds = int(settings.get("最大历史轮数", settings.get("保留历史轮数", 100)))
-        max_tokens = int(settings.get("最大生成token", settings.get("最大输出token", 1024)))
-        system = str(settings.get("系统提示词", ""))
-        max_edge = int(settings.get("最大边长", settings.get("图片最长边", 1024)))
-        if not user_text:
-            return self._result(history, "", state, [], False, {})
+        max_rounds = min(100, max(1, int(settings.get("最大历史轮数", 100))))
+        max_tokens = int(settings.get("最大生成token", 1024))
+        max_edge = min(2048, max(128, int(settings.get("最大边长", 2048))))
+        system_base = str(settings.get("系统提示词") or "")
+        selected_materials = select_material_mentions(user_text, kwargs.get("📦素材库"))
+        visual_materials = current_images or any(item["kind"] in {"image", "video"} for item in selected_materials)
+        if visual_materials and source_settings.get("mmproj_file") in ("", "None", "无"):
+            raise RuntimeError("本轮引用了图片或视频，但没有选择mmproj；请加载与主模型匹配的视觉投影。")
+
+        capabilities = {
+            "supports_images": source_settings.get("mmproj_file") not in ("", "None", "无"),
+            "supports_video": False,
+            "supports_audio": True,
+        }
+        current_content, material_stats = current_message_content(
+            user_text,
+            current_images,
+            selected_materials,
+            max_edge,
+            capabilities,
+        )
+        media_image_equivalents = (
+            int(material_stats["image_parts"])
+            + int(material_stats["video_frames"])
+            + (1 if material_stats["audio_seconds"] else 0)
+        )
+
         model = _sync_model(kwargs.get("🤖本地模型"))
-        model_settings = model.settings
         llm = model.llm
+        model_settings = model.settings
         n_ctx = int(model_settings.get("n_ctx", 8192))
-        image_max = 2048
-        history_image_count = sum(len(item.get("images") or []) for item in history)
-        if (current_images or history_image_count) and model.chat_handler is None:
-            raise RuntimeError("当前对话包含图片，但没有选择 mmproj 文件；请加载与主模型匹配的视觉投影。")
+        if visual_materials and model.chat_handler is None:
+            raise RuntimeError("本轮引用了图片或视频，但当前mmproj处理器没有成功加载；请检查视觉投影是否与主模型匹配。")
+
         skill_config = kwargs.get("🧩Skill配置")
         selected_skill = str(skill_config.get("selected") or "") if isinstance(skill_config, dict) else ""
         if selected_skill and state.get("skill") and selected_skill != state["skill"]:
-            state = _state("{}")
+            state = normalize_state({"context_cutoff": state.get("context_cutoff", 0)})
         skill = _pick_skill(llm, skill_config, user_text, state.get("skill", ""))
         if skill:
             state["skill"], state["skill_name"] = skill["id"], skill["name"]
-            system = _skill_prompt(system, skill, state)
-        elif not system:
-            system = "你是一个有帮助的AI助手。"
-        history, budget, used, output_reserve, trimmed_messages = _trim(
-            llm, history[-max_rounds * 2:], system, user_text, max_tokens, n_ctx,
-            len(current_images), image_max,
+            system = build_skill_prompt(system_base, skill, state)
+        else:
+            system = system_base or "你是一个专业、友好、准确的AI助手。"
+
+        cutoff = int(state.get("context_cutoff") or 0)
+        context_history = [
+            {"role": item["role"], "content": item["content"]}
+            for item in display_history
+            if not cutoff or int(item.get("created_at", -1)) > cutoff
+        ][-max_rounds * 2:]
+        context_history, budget, used, output_reserve, trimmed_messages = _trim(
+            llm,
+            context_history,
+            system,
+            user_text,
+            max_tokens,
+            n_ctx,
+            media_image_equivalents,
+            1536,
         )
         if output_reserve < max_tokens:
-            print(
-                f"[大炮-llama] 自动适配上下文：本轮最大输出 "
-                f"{max_tokens} -> {output_reserve} tokens"
-            )
-        messages = ([{"role": "system", "content": system}] if system else []) + _messages(history, max_edge)
-        messages.append({"role": "user", "content": _content(user_text, current_images, max_edge)})
+            print(f"[大炮-llama] 自动适配上下文：本轮最大输出 {max_tokens} -> {output_reserve} tokens")
+
         temperature = float(settings.get("温度", 0.7))
         top_p = float(settings.get("top_p", 0.9))
         top_k = int(settings.get("top_k", 20))
@@ -660,10 +820,8 @@ class DapaoMultiTurnChat:
                     temperature = 1.0
                 if abs(top_p - 0.9) < 1e-9:
                     top_p = 0.95
-            else:
-                if abs(top_p - 0.9) < 1e-9:
-                    top_p = 0.8
-            top_k = 20 if top_k == 20 else top_k
+            elif abs(top_p - 0.9) < 1e-9:
+                top_p = 0.8
         params = {
             "max_tokens": output_reserve,
             "temperature": temperature,
@@ -678,48 +836,73 @@ class DapaoMultiTurnChat:
         }
         if model_settings.get("family") == "Qwen3.8-VL":
             params["min_p"] = 0.0
+
+        def make_messages():
+            messages = ([{"role": "system", "content": system}] if system else []) + api_messages(context_history, max_edge)
+            messages.append({"role": "user", "content": current_content})
+            return messages
+
         reply, skill_state, options = "", {}, []
         for attempt in range(2):
             try:
-                response, actual_max_tokens = _create_completion(llm, messages, params)
+                response, actual_max_tokens = _create_completion(llm, make_messages(), params)
                 params["max_tokens"] = actual_max_tokens
                 output_reserve = min(output_reserve, actual_max_tokens)
                 raw = _extract_reply(response)
             except Exception as error:
-                raise RuntimeError(f"本地模型推理失败：{error}") from error
+                has_audio = any(item["kind"] == "audio" for item in selected_materials)
+                audio_hint = (
+                    " 当前本地模型或llama.cpp聊天处理器可能不支持input_audio；"
+                    "请换用支持音频的本地多模态模型，或取消@音频后重试。"
+                    if has_audio else ""
+                )
+                raise RuntimeError(f"本地模型推理失败：{error}.{audio_hint}") from error
             cleaned = raw if bool(settings.get("输出think块", False)) else _clean_reply(raw)
-            reply, skill_state = _parse_reply(cleaned.lstrip().removeprefix(": ").strip())
+            reply, skill_state = parse_skill_reply(cleaned.lstrip().removeprefix(": ").strip())
             if not skill:
                 break
             requested = [
-                x for x in skill_state.get("load_references", [])
-                if isinstance(x, str)
-                and x in skill["references"]
-                and x not in state["loaded_references"]
+                path
+                for path in skill_state.get("load_references", [])
+                if isinstance(path, str)
+                and path in skill["references"]
+                and path not in state["loaded_references"]
             ]
             if requested and attempt == 0:
                 state["loaded_references"].extend(requested)
-                system = _skill_prompt(str(settings.get("系统提示词", "")), skill, state)
-                history, budget, used, output_reserve, trimmed_messages = _trim(
-                    llm, history, system, user_text, max_tokens, n_ctx,
-                    len(current_images), image_max,
+                system = build_skill_prompt(system_base, skill, state)
+                context_history, budget, used, output_reserve, trimmed_messages = _trim(
+                    llm,
+                    context_history,
+                    system,
+                    user_text,
+                    max_tokens,
+                    n_ctx,
+                    media_image_equivalents,
+                    1536,
                 )
                 params["max_tokens"] = output_reserve
-                messages = ([{"role": "system", "content": system}] if system else []) + _messages(history, max_edge)
-                messages.append({"role": "user", "content": _content(user_text, current_images, max_edge)})
                 continue
             state["stage"] = str(skill_state.get("stage") or "进行中")[:80]
-            options = [str(x)[:240] for x in skill_state.get("options", [])[:6] if str(x).strip()] if isinstance(skill_state.get("options"), list) else []
+            raw_options = skill_state.get("options")
+            options = [str(item)[:240] for item in raw_options[:6] if str(item).strip()] if isinstance(raw_options, list) else []
             if skill_state.get("final"):
                 state["final_result"] = reply
             break
+
         created_at = _request_time(kwargs.get("🆔请求标识"))
         user_message = {
             "role": "user",
             "content": user_text,
-            "token_count": _tokens(llm, user_text) + 8 + len(current_images) * image_max,
+            "token_count": _tokens(llm, user_text) + 8 + media_image_equivalents * 1536,
             "created_at": created_at,
             **({"images": current_images} if current_images else {}),
+            **({
+                "materials": [
+                    {key: item[key] for key in ("kind", "slot", "token", "label")}
+                    for item in selected_materials
+                ],
+            } if selected_materials else {}),
         }
         assistant_message = {
             "role": "assistant",
@@ -728,8 +911,7 @@ class DapaoMultiTurnChat:
             "created_at": int(time.time() * 1000),
             "flow_before": flow_before,
         }
-        history.extend([user_message, assistant_message])
-        history = history[-max_rounds * 2:]
+        display_history.extend((user_message, assistant_message))
         conversation_used = min(n_ctx, used + assistant_message["token_count"])
         context = {
             "used_tokens": conversation_used,
@@ -740,30 +922,46 @@ class DapaoMultiTurnChat:
             "output_reserve": output_reserve,
             "requested_output": max_tokens,
             "output_auto_adjusted": output_reserve < max_tokens,
-            # Keep the old field as input-budget remaining for workflow compatibility,
-            # and expose explicit total/input values so the UI does not confuse them.
             "remaining_tokens": max(0, budget - used),
             "input_remaining_tokens": max(0, budget - used),
             "total_remaining_tokens": max(0, n_ctx - conversation_used),
             "percent": round(conversation_used / max(1, n_ctx) * 100, 1),
             "input_percent": round(used / max(1, budget) * 100, 1),
-            "current_rounds": sum(x["role"] == "user" for x in history),
+            "current_rounds": sum(item["role"] == "user" for item in context_history) + 1,
             "max_rounds": max_rounds,
             "trimmed_messages": trimmed_messages,
+            "usage_source": "local_tokenizer",
+            "model": model_settings.get("model_file", ""),
+            "material_count": len(selected_materials),
+            "material_image_parts": int(material_stats["image_parts"]),
+            "material_video_frames": int(material_stats["video_frames"]),
+            "material_audio_seconds": round(float(material_stats["audio_seconds"]), 3),
         }
-        return self._result(history, reply, state, options, True, context)
+        return self._result(display_history, reply, state, options, True, context)
 
     @staticmethod
     def _result(history, reply, state, options, sent, context):
-        return {"ui": {"📚会话历史": [json.dumps(history, ensure_ascii=False, separators=(",", ":"))], "💬助手回复": [reply], "🧩流程状态": [json.dumps(state, ensure_ascii=False, separators=(",", ":"))], "🧩选项": [json.dumps(options, ensure_ascii=False)], "📊上下文": [json.dumps(context, ensure_ascii=False)], "✅已发送": [bool(sent)]}, "result": ()}
+        history_json = json.dumps(history, ensure_ascii=False, separators=(",", ":"))
+        final_result = str(state.get("final_result") or reply or "")
+        return {
+            "ui": {
+                "📚会话历史": [history_json],
+                "💬助手回复": [reply],
+                "🧩流程状态": [json.dumps(state, ensure_ascii=False, separators=(",", ":"))],
+                "🧩选项": [json.dumps(options, ensure_ascii=False)],
+                "📊上下文": [json.dumps(context, ensure_ascii=False)],
+                "✅已发送": [bool(sent)],
+            },
+            "result": (reply, history_json, final_result),
+        }
 
 
 class DapaoMultiTurnChatV2(DapaoMultiTurnChat):
     """独立节点类型，避免已保存工作流的旧控件影响当前聊天界面。"""
 
     CATEGORY = CATEGORY
-    RETURN_TYPES = ()
-    RETURN_NAMES = ()
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("💬助手回复", "📚会话历史JSON", "🧩Skill最终结果")
     FUNCTION = "run"
     OUTPUT_NODE = True
 
@@ -783,10 +981,12 @@ def _request_time(request_id: str) -> int:
 
 NODE_CLASS_MAPPINGS = {
     "DapaoLocalModelLoader": DapaoLocalModelLoader,
+    "DapaoLocalChatMaterialLibrary": DapaoLocalChatMaterialLibrary,
     "DapaoMultiTurnChatV2": DapaoMultiTurnChatV2,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DapaoLocalModelLoader": "🤖大炮本地模型加载器@炮老师的小课堂",
+    "DapaoLocalChatMaterialLibrary": "📦大炮本地多轮对话素材库@炮老师的小课堂",
     "DapaoMultiTurnChatV2": "💬大炮本地多轮对话@炮老师的小课堂",
 }
 NODE_CLASS_MAPPINGS_MULTI = NODE_CLASS_MAPPINGS

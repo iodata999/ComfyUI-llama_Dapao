@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "aliases": {
+    "gpt-image-2": {
+      "display_name": "图像生成与编辑",
+      "source": "manual",
+      "updated_at": "2026-08-23T08:08:54.248056+00:00"
+    }
+  }
+}
